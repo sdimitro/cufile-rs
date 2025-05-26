@@ -1,0 +1,22 @@
+[package]
+name = "cufile"
+version = "0.1.0"
+edition = "2021"
+description = "Safe Rust bindings for NVIDIA CuFile library"
+authors = ["Serapheim Dimitropoulos <serapheimd@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/sdimitro/cufile-rs"
+keywords = ["nvidia", "cuda", "storage", "gpu", "direct"]
+categories = ["api-bindings", "hardware-support"]
+readme = "README.md"
+documentation = "https://docs.rs/cufile-rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+cufile-sys = "0.1"
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3.0"
