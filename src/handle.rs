@@ -38,7 +38,36 @@ impl CuFileHandle {
         self.handle
     }
 
-    /// Read data from the file directly to GPU memory
+    /// Read data from the file directly into a buffer
+    ///
+    /// # Arguments
+    /// * `buffer` - Mutable slice to read data into
+    /// * `file_offset` - Offset in the file to start reading from
+    /// * `dest_offset` - Offset relative to the buffer pointer to read into. This parameter should be used only with registered buffers.
+    ///
+    /// # Returns
+    /// Number of bytes that were successfully read
+    pub fn read(
+        &self,
+        buffer: &mut [u8],
+        file_offset: i64,
+        dest_offset: i64,
+    ) -> CuFileResult<usize> {
+        unsafe {
+            let ret = self.read_raw(
+                buffer.as_mut_ptr() as *mut c_void,
+                buffer.len(),
+                file_offset,
+                dest_offset,
+            )?;
+            Ok(ret as usize)
+        }
+    }
+
+    /// Read data from the file directly to GPU memory (low-level interface)
+    ///
+    /// This method provides direct access to CuFile's raw API for advanced users who need
+    /// to work with GPU device pointers or require fine-grained control over memory layout.
     ///
     /// # Arguments
     /// * `dest_base` - Base address of buffer in device memory or host memory. For registered buffers, dest_base must remain set to the base address used in the cuFileBufRegister call.
@@ -48,7 +77,10 @@ impl CuFileHandle {
     ///
     /// # Returns
     /// Size of bytes that were successfully read.
-    pub fn read(
+    ///
+    /// # Safety
+    /// The caller must ensure that `dest_base` points to a valid memory region of at least `size + dest_offset` bytes.
+    pub unsafe fn read_raw(
         &self,
         dest_base: *mut c_void,
         size: usize,
@@ -71,7 +103,31 @@ impl CuFileHandle {
         }
     }
 
-    /// Write data from GPU memory directly to the file
+    /// Write data from a buffer directly to the file
+    ///
+    /// # Arguments
+    /// * `buffer` - Slice containing data to write
+    /// * `file_offset` - Offset in the file to start writing to
+    /// * `dest_offset` - Offset relative to the buffer pointer to read from. This parameter should be used only with registered buffers.
+    ///
+    /// # Returns
+    /// Number of bytes that were successfully written
+    pub fn write(&self, buffer: &[u8], file_offset: i64, dest_offset: i64) -> CuFileResult<usize> {
+        unsafe {
+            let ret = self.write_raw(
+                buffer.as_ptr() as *const c_void,
+                buffer.len(),
+                file_offset,
+                dest_offset,
+            )?;
+            Ok(ret as usize)
+        }
+    }
+
+    /// Write data from GPU memory directly to the file (low-level interface)
+    ///
+    /// This method provides direct access to CuFile's raw API for advanced users who need
+    /// to work with GPU device pointers or require fine-grained control over memory layout.
     ///
     /// # Arguments
     /// * `dest_base` - Base address of buffer in device memory or host memory. For registered buffers, dest_base must remain set to the base address used in the cuFileBufRegister call.
@@ -81,7 +137,10 @@ impl CuFileHandle {
     ///
     /// # Returns
     /// The number of bytes successfully written
-    pub fn write(
+    ///
+    /// # Safety
+    /// The caller must ensure that `dest_base` points to a valid memory region of at least `size + dest_offset` bytes.
+    pub unsafe fn write_raw(
         &self,
         dest_base: *const c_void,
         size: usize,
@@ -124,7 +183,6 @@ mod tests {
     use crate::CuFileError;
 
     use super::*;
-    use libc;
     use std::fs::OpenOptions;
     use tempfile::tempdir;
 
@@ -217,24 +275,6 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_read_null_einval_error() {
-        let temp_dir = tempdir().unwrap();
-        let file_path = temp_dir.path().join("test_file.dat");
-
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&file_path)
-            .unwrap();
-
-        let handle = CuFileHandle::register(file).unwrap();
-        let ret = handle.read(ptr::null_mut(), 10, 0, 0);
-        // With errno-based error handling, passing null pointer returns EINVAL
-        assert_eq!(ret, Err(CuFileError::Unknown(libc::EINVAL)));
-    }
-
-    #[test]
     fn test_handle_read_permissions_error() {
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_file.dat");
@@ -248,7 +288,7 @@ mod tests {
 
         let handle = CuFileHandle::register(file).unwrap();
         let mut buffer = [0u8; 10];
-        let ret = handle.read(buffer.as_mut_ptr() as *mut c_void, 10, 0, 0);
+        let ret = handle.read(&mut buffer, 0, 0);
         // CuFile detects invalid file open flags before reaching filesystem level
         assert_eq!(ret, Err(CuFileError::InvalidFileOpenFlag));
     }
