@@ -58,10 +58,14 @@ impl CuFileHandle {
         unsafe {
             let ret = sys::cuFileRead(self.handle, dest_base, size, file_offset, dest_offset);
             if ret < 0 {
-                //  TODO (Serapheim):
-                // -1 on an error, so errno is set to indicate filesystem errors.
-                // All other errors return a negative integer value of the CUfileOpError enum value.
-                check_cufile_error((-ret).try_into().unwrap())?;
+                if ret == -1 {
+                    // -1 indicates a filesystem error, so errno is set
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    check_cufile_error(errno)?;
+                } else {
+                    // All other negative values are CUfileOpError enum values
+                    panic!("Unexpected CuFile error code: {}", ret);
+                }
             }
             Ok(ret)
         }
@@ -77,17 +81,24 @@ impl CuFileHandle {
     ///
     /// # Returns
     /// The number of bytes successfully written
-    pub fn write(&self, dest_base: *const c_void, size: usize, file_offset: i64, dest_offset: i64) -> CuFileResult<isize> {
+    pub fn write(
+        &self,
+        dest_base: *const c_void,
+        size: usize,
+        file_offset: i64,
+        dest_offset: i64,
+    ) -> CuFileResult<isize> {
         unsafe {
-            let ret = sys::cuFileWrite(
-                self.handle,
-                dest_base,
-                size,
-                file_offset,
-                dest_offset,
-            );
+            let ret = sys::cuFileWrite(self.handle, dest_base, size, file_offset, dest_offset);
             if ret < 0 {
-                check_cufile_error((-ret).try_into().unwrap())?;
+                if ret == -1 {
+                    // -1 indicates a filesystem error, so errno is set
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    check_cufile_error(errno)?;
+                } else {
+                    // All other negative values are CUfileOpError enum values
+                    panic!("Unexpected CuFile error code: {}", ret);
+                }
             }
             Ok(ret)
         }
@@ -107,9 +118,13 @@ unsafe impl Send for CuFileHandle {}
 // Safety: CuFileHandle can be safely shared between threads with proper synchronization
 unsafe impl Sync for CuFileHandle {}
 
+// These tests might fail if NVIDIA drivers/hardware aren't available
 #[cfg(test)]
 mod tests {
+    use crate::CuFileError;
+
     use super::*;
+    use libc;
     use std::fs::OpenOptions;
     use tempfile::tempdir;
 
@@ -125,17 +140,116 @@ mod tests {
             .open(&file_path)
             .unwrap();
 
-        // This test might fail if NVIDIA drivers/hardware aren't available
-        match CuFileHandle::register(file) {
+        CuFileHandle::register(file).unwrap();
+    }
+
+    #[test]
+    fn test_handle_already_registered() {
+        use std::mem;
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_file.dat");
+
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+
+        // Get the raw FD and create two File handles from the same FD
+        let raw_fd = file.into_raw_fd();
+        let file1 = unsafe { File::from_raw_fd(raw_fd) };
+        let file2 = unsafe { File::from_raw_fd(raw_fd) };
+
+        let hdl1 = CuFileHandle::register(file1).unwrap();
+        match CuFileHandle::register(file2) {
             Ok(_handle) => {
-                println!("Handle created successfully");
+                assert!(
+                    false,
+                    "Handle created successfully even though it should have failed"
+                );
             }
             Err(e) => {
-                println!(
-                    "Handle creation failed (expected in test environment): {:?}",
+                assert_eq!(
+                    e,
+                    CuFileError::HandleAlreadyRegistered,
+                    "Handle creation failed (expected): {:?}",
                     e
                 );
             }
         }
+
+        // Prevent hdl1 from being dropped to avoid double-close
+        // This leaks the handle but is acceptable in a test
+        mem::forget(hdl1);
+    }
+
+    #[test]
+    fn test_handle_invalid_file_type() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("/proc/self/fd/0");
+
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+
+        match CuFileHandle::register(file) {
+            Ok(_handle) => {
+                assert!(
+                    false,
+                    "Handle created successfully even though it should have failed"
+                );
+            }
+            Err(e) => {
+                assert_eq!(
+                    e,
+                    CuFileError::InvalidFile,
+                    "Handle creation failed (expected): {:?}",
+                    e
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_handle_read_null_einval_error() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_file.dat");
+
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+
+        let handle = CuFileHandle::register(file).unwrap();
+        let ret = handle.read(ptr::null_mut(), 10, 0, 0);
+        // With errno-based error handling, passing null pointer returns EINVAL
+        assert_eq!(ret, Err(CuFileError::Unknown(libc::EINVAL)));
+    }
+
+    #[test]
+    fn test_handle_read_permissions_error() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_file.dat");
+
+        let file = OpenOptions::new()
+            .create(true)
+            .read(false)
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+
+        let handle = CuFileHandle::register(file).unwrap();
+        let mut buffer = [0u8; 10];
+        let ret = handle.read(buffer.as_mut_ptr() as *mut c_void, 10, 0, 0);
+        // CuFile detects invalid file open flags before reaching filesystem level
+        assert_eq!(ret, Err(CuFileError::InvalidFileOpenFlag));
     }
 }
